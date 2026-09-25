@@ -2601,25 +2601,19 @@ export default function GradebookTable() {
     return groups;
   }, [cachedColumnsKey, columnGroupsKey]);
 
-  // Initialize all groups as collapsed by default, but preserve existing collapsed state
+  // Groups start expanded: opening the gradebook never hides a grade. Collapse state the
+  // instructor chose is preserved for groups that still exist; groups that disappear are
+  // dropped from the set.
   useEffect(() => {
     const allGroupKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
-    const baseGroupNames = [...new Set(allGroupKeys.map((key) => groupedColumns[key].groupName))];
+    const baseGroupNames = new Set(allGroupKeys.map((key) => groupedColumns[key].groupName));
     setCollapsedGroups((prev) => {
       const newSet = new Set<string>();
-
-      // Preserve existing collapsed state for groups that still exist
-      baseGroupNames.forEach((baseGroupName) => {
-        if (prev.has(baseGroupName)) {
-          newSet.add(baseGroupName);
+      prev.forEach((name) => {
+        if (baseGroupNames.has(name)) {
+          newSet.add(name);
         }
       });
-
-      // If no groups were previously collapsed, collapse all by default
-      if (newSet.size === 0 && baseGroupNames.length > 0) {
-        baseGroupNames.forEach((baseGroupName) => newSet.add(baseGroupName));
-      }
-
       return newSet;
     });
   }, [groupedColumns]);
