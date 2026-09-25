@@ -100,9 +100,13 @@ using (
 -- It only ever touches columns whose group_id is NULL and never regroups a column,
 -- so calling it again is safe and never undoes an instructor's choice.
 --
--- Slugs are read here to recover intent from legacy data. Columns created after this
--- migration are NOT grouped by slug: they arrive ungrouped (group_id NULL) until someone
--- places them. Nothing parses a slug at render time or on insert.
+-- Slugs are read here, once per insert, to place a column; the result is stored in
+-- group_id. Nothing parses a slug at render time, and a column that already has a
+-- group is never moved by this function.
+--
+-- Two callers keep new columns grouped (section 4): an AFTER INSERT trigger places
+-- every newly inserted column (a column that lands directly beside a column of the same
+-- family joins that group; a new run of two or more forms a group).
 --
 -- Policy for rows that don't fit: a column that ends up in a run of one stays ungrouped.
 -- That is also how it renders today: the table draws a one-column "group" with no header.
@@ -129,6 +133,46 @@ declare
 begin
   drop table if exists _gcg_runs;
   drop table if exists _gcg_dep_runs;
+
+  -- JOIN: an ungrouped column directly beside a grouped column of the same family (same
+  -- slug base, or computed from exactly the same columns) joins that group. This is what
+  -- places a column inserted next to an existing group. The left neighbour wins a tie.
+  with ordered as (
+    select
+      c.id, c.gradebook_id, c.group_id,
+      coalesce(c.sort_order, 0) as so,
+      case
+        when split_part(c.slug, '-', 1) = 'assignment'
+         and cardinality(string_to_array(c.slug, '-')) >= 3
+          then 'assignment-' || split_part(c.slug, '-', 2)
+        else coalesce(nullif(split_part(c.slug, '-', 1), ''), 'other')
+      end as base,
+      case
+        when jsonb_typeof(c.dependencies -> 'gradebook_columns') = 'array'
+         and jsonb_array_length(c.dependencies -> 'gradebook_columns') > 0
+        then (select jsonb_agg(x order by x) from jsonb_array_elements(c.dependencies -> 'gradebook_columns') x)
+      end as deps
+    from public.gradebook_columns c
+    where p_gradebook_id is null or c.gradebook_id = p_gradebook_id
+  ),
+  nb as (
+    select
+      o.id, o.group_id,
+      case
+        when lag(o.group_id) over w is not null
+         and (lag(o.base) over w = o.base or (o.deps is not null and lag(o.deps) over w = o.deps))
+          then lag(o.group_id) over w
+        when lead(o.group_id) over w is not null
+         and (lead(o.base) over w = o.base or (o.deps is not null and lead(o.deps) over w = o.deps))
+          then lead(o.group_id) over w
+      end as join_group
+    from ordered o
+    window w as (partition by o.gradebook_id order by o.so, o.id)
+  )
+  update public.gradebook_columns gc
+  set group_id = nb.join_group
+  from nb
+  where gc.id = nb.id and gc.group_id is null and nb.join_group is not null;
 
   -- Runs of same-family, ungrouped columns, by position within each gradebook.
   create temp table _gcg_runs on commit drop as
@@ -333,6 +377,39 @@ comment on function public.gradebook_column_groups_backfill(bigint) is
 -- Not an instructor-facing RPC: only migrations and admin scripts may run it.
 revoke all on function public.gradebook_column_groups_backfill(bigint) from public, anon, authenticated;
 grant execute on function public.gradebook_column_groups_backfill(bigint) to service_role;
+
+------------------------------------------------------------------------------
+-- 4. KEEP NEW COLUMNS GROUPED
+-- Without this, every column created after the migration (every new assignment, every
+-- new course) would arrive ungrouped and the gradebook would lose all its headers.
+-- Statement-level, so a bulk insert places its columns in one pass. SECURITY DEFINER
+-- because instructors and the assignment trigger insert columns but may not execute the
+-- backfill directly; it only ever touches the gradebooks the statement inserted into.
+------------------------------------------------------------------------------
+
+create or replace function public.gradebook_columns_place_new_columns()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+declare
+  v_gradebook_id bigint;
+begin
+  for v_gradebook_id in select distinct gradebook_id from new_columns loop
+    perform public.gradebook_column_groups_backfill(v_gradebook_id);
+  end loop;
+  return null;
+end;
+$fn$;
+
+revoke all on function public.gradebook_columns_place_new_columns() from public, anon, authenticated;
+
+create trigger gradebook_columns_place_new_columns
+after insert on public.gradebook_columns
+referencing new table as new_columns
+for each statement
+execute function public.gradebook_columns_place_new_columns();
 
 -- Every gradebook that exists right now comes out of this migration grouped.
 select public.gradebook_column_groups_backfill();
